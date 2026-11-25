@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Maze robot dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #101317; --panel: #181c22; --line: #2a3039; --text: #d8dee6; --dim: #7d8794;
+    --accent: #4fb3ff; --black: #f5c542; --fwd: #4cd07d; --rev: #ff6b6b; --warn: #ffb347;
+    font-family: ui-monospace, "JetBrains Mono", "DejaVu Sans Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-size: 13px; }
+  header { display: flex; gap: 12px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0 12px 0 0; font-weight: 600; }
+  main { display: grid; grid-template-columns: 1.15fr 1fr 1fr; gap: 12px; padding: 12px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
+  section h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0 0 10px; font-weight: 600; }
+  .span2 { grid-column: span 2; } .span3 { grid-column: span 3; }
+  button { background: #222831; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 7px 12px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #17324a; border-color: #2c5d86; }
+  button.danger { background: #4a1c1c; border-color: #8a3434; }
+  button.on { background: var(--accent); color: #000; border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .pill { padding: 3px 9px; border-radius: 999px; background: #222831; border: 1px solid var(--line); }
+  .pill.ok { color: var(--fwd); border-color: #2f6b47; } .pill.bad { color: var(--rev); border-color: #6b2f2f; }
+  .pill.paused { color: #000; background: var(--warn); border-color: var(--warn); }
+  input[type=number] { width: 70px; background: #0d1014; color: var(--text); border: 1px solid var(--line); border-radius: 5px; padding: 5px; font: inherit; }
+  input[type=range] { accent-color: var(--accent); }
+  label { color: var(--dim); }
+  canvas { width: 100%; display: block; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 14px; }
+  .kv span:nth-child(odd) { color: var(--dim); }
+  .big { font-size: 20px; font-weight: 600; }
+  #log { height: 190px; overflow-y: auto; background: #0d1014; border-radius: 6px; padding: 8px; white-space: pre-wrap; font-size: 12px; line-height: 1.45; }
+  #log .node { color: var(--accent); } #log .sys { color: var(--warn); } #log .me { color: var(--dim); }
+  .pad { display: grid; grid-template-columns: repeat(3, 56px); gap: 6px; }
+  .pad button { height: 48px; padding: 0; font-size: 18px; }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  kbd { background: #0d1014; border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
+  .modes button { padding: 6px 10px; }
+  #unsupported { display: none; background: #4a1c1c; padding: 10px 16px; }
+</style>
+</head>
+<body>
+<div id="unsupported">This browser has no Web Serial. Use Chrome, Chromium, Edge or Brave, and open the page from <b>http://localhost</b>.</div>
+<header>
+  <h1>Maze robot</h1>
+  <button id="connect" class="primary">Connect</button>
+  <span id="conn" class="pill bad">disconnected</span>
+  <span id="runstate" class="pill">–</span>
+  <span id="rate" class="pill">0 Hz</span>
+  <span style="flex:1"></span>
+  <span class="modes row" style="margin:0" id="modes">
+    <label>mode</label>
+    <button data-mode="0">Maze route</button>
+    <button data-mode="1">Line test</button>
+    <button data-mode="2">Sensors only</button>
+    <button data-mode="3">Manual</button>
+    <button data-mode="4">Motor test</button>
+  </span>
+</header>
+
+<main>
+  <!-- SENSORS -->
+  <section>
+    <h2>Line sensors (raw, 0 = leftmost seen from behind)</h2>
+    <canvas id="sensors" height="250" style="cursor:ns-resize; touch-action:none"></canvas>
+    <div class="row" style="margin-top:8px">
+      <span class="pill">pattern <b id="bits">--------</b></span>
+      <span class="pill">error <b id="err">0</b></span>
+      <span class="pill">steer <b id="steer">0</b></span>
+      <span class="pill" title="times the line vanished for less than LINE_LOST_MS (ignored glitches)">dropouts <b id="blips">–</b></span>
+    </div>
+    <div class="hint">Drag a red line to move that sensor's threshold. ± = noise (how much it jumps, last second).</div>
+  </section>
+
+  <!-- ROBOT -->
+  <section>
+    <h2>Wheels (commanded PWM)</h2>
+    <canvas id="robot" height="270"></canvas>
+  </section>
+
+  <!-- STATE -->
+  <section>
+    <h2>Route</h2>
+    <div class="row"><span class="big" id="from">–</span><span class="big" style="color:var(--dim)">→</span><span class="big" id="to">–</span></div>
+    <div class="kv">
+      <span>step</span><span id="pidx">–</span>
+      <span>items</span><span id="items">–</span>
+      <span>status</span><span id="status">–</span>
+      <span>robot ms</span><span id="ms">–</span>
+      <span>drive / turn / search</span><span id="speeds">–</span>
+    </div>
+  </section>
+
+  <!-- CHART -->
+  <section class="span2">
+    <h2>Last 10 seconds</h2>
+    <canvas id="chart" height="200"></canvas>
+    <div class="hint"><span style="color:var(--accent)">━ line error ÷ 10</span> &nbsp; <span style="color:var(--fwd)">━ left out</span> &nbsp; <span style="color:#c58cff">━ right out</span> &nbsp; <span style="color:var(--warn)">▮ paused</span> &nbsp; <span style="color:var(--black)">│ node</span></div>
+  </section>
+
+  <!-- RUN CONTROL -->
+  <section>
+    <h2>Run control (maze / line test / motor test)</h2>
+    <div class="row">
+      <button id="run" class="primary">▶ Run <kbd>R</kbd></button>
+      <button id="pause">⏸ Pause <kbd>P</kbd></button>
+      <button id="stop" class="danger">■ Stop <kbd>Space</kbd></button>
+    </div>
+    <div class="row">
+      <button id="step">Step <kbd>.</kbd></button>
+      <input type="number" id="stepms" value="150" min="10" max="5000" step="10"><label>ms</label>
+      <button id="next">To next node <kbd>N</kbd></button>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="breaknodes"> pause at every node</label>
+      <button id="reset">Restart route</button>
+    </div>
+    <div class="row">
+      <label>slow motion</label>
+      <input type="range" id="scale" min="5" max="100" value="100" step="5" style="flex:1">
+      <b id="scaleval">100%</b>
+    </div>
+    <div class="hint">Slow motion scales speed <i>and</i> timed moves, so turns cover the same angle. Below ~40% the motors may stall.</div>
+  </section>
+
+  <!-- MANUAL -->
+  <section>
+    <h2>Manual drive</h2>
+    <div class="row" style="align-items:flex-start; gap:16px">
+      <div class="pad">
+        <span></span><button data-dir="f">▲</button><span></span>
+        <button data-dir="l">◀</button><button data-dir="s">■</button><button data-dir="r">▶</button>
+        <span></span><button data-dir="b">▼</button><span></span>
+      </div>
+      <div style="flex:1">
+        <div class="row"><label>speed</label><input type="range" id="mspeed" min="30" max="255" value="120" style="flex:1"><b id="mspeedval">120</b></div>
+        <div class="row"><label>turn</label><input type="range" id="mturn" min="30" max="255" value="110" style="flex:1"><b id="mturnval">110</b></div>
+        <div class="hint">Hold <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrows or the buttons. Switches to Manual mode.</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Jog (one short move)</h2>
+    <div class="row">
+      <label>L</label><input type="number" id="jl" value="120" min="-255" max="255">
+      <label>R</label><input type="number" id="jr" value="120" min="-255" max="255">
+      <label>ms</label><input type="number" id="jms" value="200" min="10" max="5000" step="10">
+      <button id="jog" class="primary">Jog</button>
+    </div>
+    <div class="row">
+      <button data-jog="120,0">left wheel fwd</button>
+      <button data-jog="-120,0">left wheel back</button>
+      <button data-jog="0,120">right wheel fwd</button>
+      <button data-jog="0,-120">right wheel back</button>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="revL"> reverse left motor</label>
+      <label><input type="checkbox" id="revR"> reverse right motor</label>
+    </div>
+    <div class="row">
+      <button data-jog="120,120">forward</button>
+      <button data-jog="-120,120">spin left</button>
+      <button data-jog="120,-120">spin right</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Line thresholds</h2>
+    <div id="thgrid" style="display:grid; grid-template-columns:repeat(8,1fr); gap:4px; margin-bottom:8px"></div>
+    <div class="row">
+      <label>all</label><input type="number" id="thall" value="500" min="0" max="1023" step="10">
+      <button id="thallset">Set all</button>
+      <button id="calib">Calibrate</button>
+    </div>
+    <div class="row">
+      <button id="thsave" class="primary">Save on robot</button>
+      <button id="thdefault">Back to config.h</button>
+    </div>
+    <div class="row">
+      <label title="the line must be gone this long before the robot reacts (turns around / searches); shorter dropouts are ignored">line lost after</label>
+      <input type="number" id="lostms" value="100" min="0" max="2000" step="10"><label>ms</label>
+      <button id="lostset">Set</button>
+    </div>
+    <div class="row"><label><input type="checkbox" id="dblread"> read each sensor twice (less crosstalk)</label></div>
+    <div class="hint" id="calibhint">Calibrate: press it, sweep every sensor over the wood <i>and</i> the line, press again. Each threshold goes halfway between the darkest and lightest reading. Changes are live; <b>Save on robot</b> keeps them after a restart.</div>
+  </section>
+
+  <!-- LOG -->
+  <section class="span3">
+    <h2 class="row" style="justify-content:space-between; margin-bottom:6px">Log
+      <span><label><input type="checkbox" id="autoscroll" checked> follow</label> <button id="clearlog">clear</button></span></h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const MODE_NAMES = ['maze route', 'line test', 'sensors only', 'manual', 'motor test'];
+
+// ---------------------------------------------------------------- state
+let port = null, writer = null, reader = null, pipeDone = null, reading = false;
+let cfg = { th: [500,500,500,500,500,500,500,600], dir: [1,1,1,1,1,1,1,1], def: null, drive: '?', turn: '?', search: '?' };
+let drag = null;                     // sensor index whose threshold is being dragged
+let calib = null;                    // {min:[], max:[]} while calibrating
+const rawHist = [];                  // recent raw readings, for the noise figure
+let t = null;                        // latest telemetry
+const history = [];                  // {time, err, l, r, paused}
+const nodeMarks = [];                // times a node was reached
+let frames = 0, lastBlips = null;
+
+// ---------------------------------------------------------------- serial
+if (!('serial' in navigator)) $('unsupported').style.display = 'block';
+
+$('connect').onclick = async () => {
+  if (port) { await disconnect(); return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    writer = port.writable.getWriter();
+    $('connect').textContent = 'Disconnect';
+    setConn(true);
+    readLoop();
+    await send('?');
+    await send('v ' + $('scale').value);
+  } catch (e) { log('connect failed: ' + e.message, 'sys'); port = null; }
+};
+
+async function disconnect() {
+  reading = false;
+  const p = port; port = null;          // so readLoop doesn't report it as a lost robot
+  try { await send('q'); } catch {}
+  // The port only closes once the pending read is cancelled and both streams are unlocked
+  try { reader && await reader.cancel(); } catch {}
+  try { pipeDone && await pipeDone; } catch {}
+  try { writer && writer.releaseLock(); } catch {}
+  try { await p.close(); log('disconnected, port released', 'sys'); }
+  catch (e) { log('could not release the port: ' + e.message + ' - close this tab to free it', 'sys'); }
+  writer = null; reader = null;
+  $('connect').textContent = 'Connect';
+  setConn(false);
+}
+
+async function readLoop() {
+  reading = true;
+  const decoder = new TextDecoderStream();
+  pipeDone = port.readable.pipeTo(decoder.writable).catch(() => {});
+  reader = decoder.readable.getReader();
+  let buf = '';
+  try {
+    while (reading) {
+      const { value, done: end } = await reader.read();
+      if (end) break;
+      buf += value;
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        handleLine(buf.slice(0, nl).replace(/\r$/, ''));
+        buf = buf.slice(nl + 1);
+      }
+    }
+  } catch (e) { log('serial error: ' + e.message, 'sys'); }
+  try { reader.releaseLock(); } catch {}
+  if (port) { log('robot disconnected', 'sys'); port = null; writer = null; $('connect').textContent = 'Connect'; setConn(false); }
+}
+
+async function send(cmd) {
+  if (!writer) return;
+  await writer.write(new TextEncoder().encode(cmd + '\n'));
+}
+
+function setConn(on) {
+  $('conn').textContent = on ? 'connected' : 'disconnected';
+  $('conn').className = 'pill ' + (on ? 'ok' : 'bad');
+}
+
+// ---------------------------------------------------------------- parsing
+function handleLine(line) {
+  if (!line) return;
+  const p = line.split(' ');
+  if (p[0] === 'T' && p.length >= 25) {
+    const n = i => +p[i];
+    t = {
+      ms: n(1), mode: n(2), flags: n(3), raw: p.slice(4, 12).map(Number), bits: p[12],
+      err: n(13), steer: n(14), reqL: n(15), reqR: n(16), outL: n(17), outR: n(18),
+      scale: n(19), from: p[20], to: p[21], items: n(22), idx: n(23), len: n(24),
+      blips: p.length > 25 ? n(25) : null,
+    };
+    t.paused = !!(t.flags & 1);
+    rawHist.push(t.raw); if (rawHist.length > 20) rawHist.shift();
+    if (calib) t.raw.forEach((v, i) => { calib.min[i] = Math.min(calib.min[i], v); calib.max[i] = Math.max(calib.max[i], v); });
+    $('dblread').checked = !!(t.flags & 64);
+    $('revL').checked = !!(t.flags & 128); $('revR').checked = !!(t.flags & 256);
+    frames++;
+    history.push({ time: performance.now(), err: t.err, l: t.outL, r: t.outR, paused: t.paused && [0,1,4].includes(t.mode) });
+    while (history.length && performance.now() - history[0].time > 10000) history.shift();
+    updateText();
+    return;
+  }
+  if (p[0] === 'C' && p.length >= 20) {
+    cfg.th = p.slice(1, 9).map(Number); cfg.dir = p.slice(9, 17).map(Number);
+    cfg.drive = p[17]; cfg.turn = p[18]; cfg.search = p[19];
+    if (p.length >= 28) cfg.def = p.slice(20, 28).map(Number);
+    if (p.length >= 29 && document.activeElement !== $('lostms')) $('lostms').value = p[28];
+    if (!drag) updateThInputs();
+    $('speeds').textContent = `${cfg.drive} / ${cfg.turn} / ${cfg.search}`;
+    return;
+  }
+  const isNode = /^(At |SIDE LINE|LINE LOST|corner|line lost)/.test(line);
+  if (isNode) nodeMarks.push(performance.now());
+  log(line, isNode ? 'node' : line.startsWith('#') ? 'sys' : '');
+}
+
+function log(text, cls = '') {
+  const el = document.createElement('div');
+  el.textContent = text; if (cls) el.className = cls;
+  const box = $('log');
+  box.appendChild(el);
+  while (box.childNodes.length > 500) box.firstChild.remove();
+  if ($('autoscroll').checked) box.scrollTop = box.scrollHeight;
+}
+$('clearlog').onclick = () => $('log').innerHTML = '';
+
+setInterval(() => { $('rate').textContent = frames + ' Hz'; frames = 0; }, 1000);
+
+function updateText() {
+  if (t.blips !== null) {
+    if (lastBlips !== null && t.blips > lastBlips) { log(`line dropout x${t.blips - lastBlips} (ignored, total ${t.blips})`, 'sys'); $('blips').parentElement.style.borderColor = 'var(--warn)'; }
+    lastBlips = t.blips; $('blips').textContent = t.blips;
+  }
+  $('bits').textContent = t.bits; $('err').textContent = t.err; $('steer').textContent = t.steer;
+  $('from').textContent = t.from; $('to').textContent = t.to;
+  $('pidx').textContent = t.mode === 0 ? `${t.idx + 1} / ${t.len}` : '–';
+  $('items').textContent = t.items; $('ms').textContent = t.ms;
+  const st = [];
+  if (t.flags & 16) st.push('route done'); if (t.flags & 32) st.push('going home');
+  if (t.flags & 4) st.push('stepping'); if (t.flags & 8) st.push('running to node');
+  if (t.flags & 2) st.push('break at nodes');
+  $('status').textContent = st.join(', ') || 'running';
+  const pausable = [0, 1, 4].includes(t.mode);
+  $('runstate').textContent = MODE_NAMES[t.mode] + (pausable ? (t.paused ? ' · PAUSED' : ' · running') : '');
+  $('runstate').className = 'pill' + (pausable && t.paused ? ' paused' : '');
+  document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', +b.dataset.mode === t.mode));
+  $('breaknodes').checked = !!(t.flags & 2);
+}
+
+// ---------------------------------------------------------------- drawing
+function fit(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = +canvas.getAttribute('height');
+  if (canvas.width !== Math.round(w * dpr)) { canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr); canvas.style.height = h + 'px'; }
+  const ctx = canvas.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [ctx, w, h];
+}
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+function sensorGeom() {
+  const cv = $('sensors'), w = cv.clientWidth, h = +cv.getAttribute('height');
+  return { w, h, top: 8, bot: h - 56, gap: 8, bw: (w - 8 * 9) / 8 };
+}
+function noise(i) {
+  if (rawHist.length < 5) return 0;
+  const v = rawHist.map(r => r[i]), m = v.reduce((a, b) => a + b) / v.length;
+  return Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length);
+}
+function drawSensors() {
+  const [c, w, h] = fit($('sensors'));
+  c.clearRect(0, 0, w, h);
+  const { top, bot, gap, bw } = sensorGeom();
+  for (let i = 0; i < 8; i++) {
+    const x = gap + i * (bw + gap);
+    const raw = t ? t.raw[i] : 0, isBlack = t ? t.bits[i] === '1' : false;
+    c.fillStyle = '#0d1014'; c.fillRect(x, top, bw, bot - top);
+    const y = bot - (raw / 1023) * (bot - top);
+    c.fillStyle = isBlack ? css('--black') : '#3d5a73'; c.fillRect(x, y, bw, bot - y);
+    const ty = bot - (cfg.th[i] / 1023) * (bot - top);
+    c.strokeStyle = css('--rev'); c.lineWidth = drag === i ? 3 : 1.5; c.setLineDash(drag === i ? [] : [4, 3]);
+    c.beginPath(); c.moveTo(x - 2, ty); c.lineTo(x + bw + 2, ty); c.stroke(); c.setLineDash([]); c.lineWidth = 1;
+    if (drag === i) { c.fillStyle = css('--rev'); c.font = '600 12px ui-monospace, monospace'; c.textAlign = 'center'; c.fillText(cfg.th[i], x + bw / 2, ty - 5); }
+    if (calib && calib.max[i] >= 0) {               // seen range while calibrating
+      const y1 = bot - calib.max[i] / 1023 * (bot - top), y2 = bot - calib.min[i] / 1023 * (bot - top);
+      c.fillStyle = 'rgba(79,179,255,.35)'; c.fillRect(x + bw - 5, y1, 5, Math.max(2, y2 - y1));
+    }
+    c.fillStyle = css('--text'); c.textAlign = 'center'; c.font = '12px ui-monospace, monospace';
+    c.fillText(raw, x + bw / 2, bot + 15);
+    c.fillStyle = css('--dim'); c.fillText(i, x + bw / 2, bot + 30);
+    const n = noise(i);
+    c.fillStyle = n > 40 ? css('--rev') : n > 15 ? css('--warn') : css('--dim');
+    c.fillText('±' + Math.round(n), x + bw / 2, bot + 45);
+  }
+  // line position marker over sensors 1..6 (-2500..2500)
+  if (t) {
+    const x1 = gap + 1 * (bw + gap) + bw / 2, x6 = gap + 6 * (bw + gap) + bw / 2;
+    const x = x1 + (t.err + 2500) / 5000 * (x6 - x1);
+    c.fillStyle = css('--accent'); c.beginPath(); c.moveTo(x, top + 2); c.lineTo(x - 6, top - 6 + 2); c.lineTo(x + 6, top - 6 + 2); c.fill();
+    c.fillRect(x - 1, top, 2, bot - top);
+  }
+}
+
+const treadPhase = [0, 0]; let lastDraw = performance.now();
+function drawRobot() {
+  const [c, w, h] = fit($('robot'));
+  const now = performance.now(), dt = (now - lastDraw) / 1000; lastDraw = now;
+  c.clearRect(0, 0, w, h);
+  const cx = w / 2, bodyW = 130, bodyH = 170, top = 40;
+  const outs = t ? [t.outL, t.outR] : [0, 0], reqs = t ? [t.reqL, t.reqR] : [0, 0];
+
+  // body
+  c.fillStyle = '#222831'; c.strokeStyle = '#3a424d'; c.lineWidth = 2;
+  roundRect(c, cx - bodyW / 2, top, bodyW, bodyH, 14); c.fill(); c.stroke();
+  // sensor bar at the front
+  for (let i = 0; i < 8; i++) {
+    const sx = cx - 56 + i * 16;
+    c.fillStyle = t && t.bits[i] === '1' ? css('--black') : '#0d1014';
+    c.beginPath(); c.arc(sx, top + 14, 5, 0, Math.PI * 2); c.fill();
+  }
+  c.fillStyle = css('--dim'); c.font = '11px ui-monospace, monospace'; c.textAlign = 'center';
+  c.fillText('front', cx, top - 8);
+
+  // wheels
+  const wheelH = 74, wheelW = 26, wy = top + bodyH - wheelH - 20;
+  [-1, 1].forEach((side, k) => {
+    const wx = side < 0 ? cx - bodyW / 2 - wheelW - 4 : cx + bodyW / 2 + 4;
+    treadPhase[k] = (treadPhase[k] + outs[k] / 255 * dt * 120) % 12;
+    c.save(); roundRect(c, wx, wy, wheelW, wheelH, 6); c.clip();
+    c.fillStyle = '#0d1014'; c.fillRect(wx, wy, wheelW, wheelH);
+    c.strokeStyle = outs[k] > 0 ? css('--fwd') : outs[k] < 0 ? css('--rev') : '#3a424d'; c.lineWidth = 3;
+    for (let y = wy - 12 + (12 - treadPhase[k]) % 12; y < wy + wheelH + 12; y += 12) {
+      c.beginPath(); c.moveTo(wx, y); c.lineTo(wx + wheelW, y); c.stroke();
+    }
+    c.restore();
+    // arrow: length = output
+    const ax = side < 0 ? wx - 20 : wx + wheelW + 20, ay = wy + wheelH / 2;
+    const len = outs[k] / 255 * 85;
+    if (Math.abs(len) > 1) {
+      c.strokeStyle = c.fillStyle = outs[k] > 0 ? css('--fwd') : css('--rev'); c.lineWidth = 6;
+      c.beginPath(); c.moveTo(ax, ay); c.lineTo(ax, ay - len); c.stroke();
+      const d = Math.sign(len);
+      c.beginPath(); c.moveTo(ax - 9, ay - len + d * 2); c.lineTo(ax + 9, ay - len + d * 2); c.lineTo(ax, ay - len - d * 12); c.fill();
+    }
+    // ghost of requested speed while paused / scaled
+    if (reqs[k] !== outs[k]) {
+      const rl = reqs[k] / 255 * 85; c.strokeStyle = 'rgba(255,255,255,.25)'; c.lineWidth = 2; c.setLineDash([3, 3]);
+      c.beginPath(); c.moveTo(ax + side * 12, ay); c.lineTo(ax + side * 12, ay - rl); c.stroke(); c.setLineDash([]);
+    }
+    c.fillStyle = css('--text'); c.font = '600 15px ui-monospace, monospace';
+    c.fillText(outs[k], wx + wheelW / 2, wy + wheelH + 22);
+    c.fillStyle = css('--dim'); c.font = '11px ui-monospace, monospace';
+    c.fillText(side < 0 ? 'LEFT' : 'RIGHT', wx + wheelW / 2, wy + wheelH + 37);
+    if (reqs[k] !== outs[k]) c.fillText('asked ' + reqs[k], wx + wheelW / 2, wy - 8);
+  });
+}
+
+function drawChart() {
+  const [c, w, h] = fit($('chart'));
+  c.clearRect(0, 0, w, h);
+  const now = performance.now(), X = time => w - (now - time) / 10000 * w, Y = v => h / 2 - v / 255 * (h / 2 - 6);
+  c.strokeStyle = '#2a3039'; c.lineWidth = 1;
+  [-255, -128, 0, 128, 255].forEach(v => { c.beginPath(); c.moveTo(0, Y(v)); c.lineTo(w, Y(v)); c.stroke(); });
+  c.fillStyle = css('--dim'); c.font = '10px ui-monospace, monospace'; c.textAlign = 'left';
+  [255, 0, -255].forEach(v => c.fillText(v, 3, Y(v) + (v > 0 ? 10 : v < 0 ? -3 : -3)));
+  // paused regions
+  c.fillStyle = 'rgba(255,179,71,.12)';
+  for (let i = 1; i < history.length; i++) if (history[i].paused) c.fillRect(X(history[i - 1].time), 0, X(history[i].time) - X(history[i - 1].time) + 1, h);
+  // node marks
+  while (nodeMarks.length && now - nodeMarks[0] > 10000) nodeMarks.shift();
+  c.strokeStyle = css('--black'); nodeMarks.forEach(m => { c.beginPath(); c.moveTo(X(m), 0); c.lineTo(X(m), h); c.stroke(); });
+  const line = (key, color, f = v => v) => {
+    c.strokeStyle = color; c.lineWidth = 1.6; c.beginPath();
+    history.forEach((p, i) => { const y = Y(Math.max(-255, Math.min(255, f(p[key])))); i ? c.lineTo(X(p.time), y) : c.moveTo(X(p.time), y); });
+    c.stroke();
+  };
+  line('err', css('--accent'), v => v / 10); line('l', css('--fwd')); line('r', '#c58cff');
+}
+
+function roundRect(c, x, y, w, h, r) { c.beginPath(); c.roundRect(x, y, w, h, r); }
+
+(function frame() { drawSensors(); drawRobot(); drawChart(); requestAnimationFrame(frame); })();
+
+// ---------------------------------------------------------------- controls
+const cmd = (s, quiet) => { if (!quiet) log('> ' + s, 'me'); send(s); };
+document.querySelectorAll('#modes button').forEach(b => b.onclick = () => cmd('m ' + b.dataset.mode));
+$('run').onclick = () => cmd('r');
+$('pause').onclick = () => cmd('p');
+$('stop').onclick = () => { manual.clear(); cmd('x'); };
+$('step').onclick = () => cmd('s ' + $('stepms').value);
+$('next').onclick = () => cmd('n');
+$('reset').onclick = () => cmd('z');
+$('breaknodes').onchange = e => cmd('b ' + (e.target.checked ? 1 : 0));
+$('scale').oninput = e => { $('scaleval').textContent = e.target.value + '%'; cmd('v ' + e.target.value, true); };
+$('mspeed').oninput = e => $('mspeedval').textContent = e.target.value;
+$('mturn').oninput = e => $('mturnval').textContent = e.target.value;
+
+// ---- thresholds
+function updateThInputs() {
+  const g = $('thgrid');
+  if (!g.children.length) for (let i = 0; i < 8; i++) {
+    const inp = document.createElement('input');
+    Object.assign(inp, { type: 'number', min: 0, max: 1023, step: 10, title: 'sensor ' + i });
+    inp.style.width = '100%';
+    inp.onchange = () => setTh(i, +inp.value);
+    g.appendChild(inp);
+  }
+  cfg.th.forEach((v, i) => { if (document.activeElement !== g.children[i]) g.children[i].value = v; });
+}
+function setTh(i, v) { v = Math.max(0, Math.min(1023, Math.round(v))); if (i < 8) cfg.th[i] = v; else cfg.th.fill(v); send(`t ${i} ${v}`); }
+updateThInputs();
+$('thallset').onclick = () => { setTh(8, +$('thall').value); log('> all thresholds ' + $('thall').value, 'me'); };
+$('thsave').onclick = () => cmd('w');
+$('lostset').onclick = () => cmd('l ' + $('lostms').value);
+$('lostms').onkeydown = e => { if (e.key === 'Enter') $('lostset').click(); };
+$('thdefault').onclick = () => cmd('e');
+$('revL').onchange = $('revR').onchange = () => cmd(`i ${+$('revL').checked} ${+$('revR').checked}`);
+$('dblread').onchange = e => cmd('a ' + (e.target.checked ? 1 : 0));
+$('calib').onclick = () => {
+  if (!calib) {
+    calib = { min: Array(8).fill(1024), max: Array(8).fill(-1) };
+    $('calib').textContent = 'Done - apply'; $('calib').classList.add('on');
+    log('calibrating: sweep every sensor over wood and line', 'sys');
+    return;
+  }
+  const c = calib; calib = null;
+  $('calib').textContent = 'Calibrate'; $('calib').classList.remove('on');
+  const res = [];
+  for (let i = 0; i < 8; i++) {
+    if (c.max[i] - c.min[i] < 100) { res.push(`${i}: range too small (${c.min[i]}-${c.max[i]}), kept ${cfg.th[i]}`); continue; }
+    const v = Math.round((c.min[i] + c.max[i]) / 2);
+    setTh(i, v); res.push(`${i}: ${c.min[i]}-${c.max[i]} -> ${v}`);
+  }
+  log('calibration: ' + res.join(' | ') + '   (press "Save on robot" to keep)', 'sys');
+};
+
+// drag the red threshold lines
+const sc = $('sensors');
+function dragPos(e) {
+  const r = sc.getBoundingClientRect(), g = sensorGeom();
+  const x = e.clientX - r.left, y = e.clientY - r.top;
+  const i = Math.max(0, Math.min(7, Math.floor((x - g.gap / 2) / (g.bw + g.gap))));
+  const v = (g.bot - y) / (g.bot - g.top) * 1023;
+  return [i, Math.max(0, Math.min(1023, Math.round(v / 5) * 5))];
+}
+let dragSent = 0;
+sc.onpointerdown = e => { const [i, v] = dragPos(e); drag = i; sc.setPointerCapture(e.pointerId); cfg.th[i] = v; };
+sc.onpointermove = e => {
+  if (drag === null) return;
+  const v = dragPos(e)[1]; cfg.th[drag] = v;
+  if (performance.now() - dragSent > 80) { dragSent = performance.now(); send(`t ${drag} ${v}`); }
+};
+sc.onpointerup = sc.onpointercancel = () => {
+  if (drag === null) return;
+  send(`t ${drag} ${cfg.th[drag]}`); log(`> threshold ${drag} = ${cfg.th[drag]}`, 'me'); drag = null; updateThInputs();
+};
+
+function ensureManual() { if (!t || t.mode !== 3) { cmd('m 3'); if (t) t.mode = 3; } }
+function jog(l, r, ms) { ensureManual(); cmd(`j ${l} ${r} ${ms}`); }
+$('jog').onclick = () => jog(+$('jl').value, +$('jr').value, +$('jms').value);
+document.querySelectorAll('[data-jog]').forEach(b => b.onclick = () => { const [l, r] = b.dataset.jog.split(','); jog(l, r, $('jms').value); });
+
+// Hold-to-drive: resend every 100 ms, robot stops on its own after 300 ms of silence
+const manual = {
+  held: new Set(), timer: null,
+  speeds() {
+    const v = +$('mspeed').value, tv = +$('mturn').value, h = this.held;
+    let fwd = (h.has('f') ? 1 : 0) - (h.has('b') ? 1 : 0), turn = (h.has('r') ? 1 : 0) - (h.has('l') ? 1 : 0);
+    if (fwd === 0) return [turn * tv, -turn * tv];                 // spin on the spot
+    return [fwd * v + turn * tv / 2, fwd * v - turn * tv / 2];     // curve
+  },
+  push() { const [l, r] = this.speeds(); send(`d ${Math.round(l)} ${Math.round(r)}`); },
+  press(d) {
+    if (d === 's') { this.clear(); return; }
+    ensureManual(); this.held.add(d); this.push();
+    if (!this.timer) this.timer = setInterval(() => this.push(), 100);
+  },
+  release(d) { this.held.delete(d); if (!this.held.size) this.clear(); else this.push(); },
+  clear() { this.held.clear(); clearInterval(this.timer); this.timer = null; send('d 0 0'); },
+};
+document.querySelectorAll('[data-dir]').forEach(b => {
+  b.onpointerdown = e => { b.setPointerCapture(e.pointerId); manual.press(b.dataset.dir); };
+  b.onpointerup = b.onpointercancel = () => manual.release(b.dataset.dir);
+});
+
+const KEYS = { w: 'f', arrowup: 'f', s: 'b', arrowdown: 'b', a: 'l', arrowleft: 'l', d: 'r', arrowright: 'r' };
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' && e.target.type === 'number') return;
+  const k = e.key.toLowerCase();
+  if (KEYS[k]) { e.preventDefault(); if (!e.repeat) manual.press(KEYS[k]); return; }
+  if (e.repeat) return;
+  if (k === ' ') { e.preventDefault(); $('stop').click(); }
+  else if (k === 'p') cmd('p');
+  else if (k === 'r') cmd('r');
+  else if (k === '.') $('step').click();
+  else if (k === 'n') cmd('n');
+});
+addEventListener('keyup', e => { const d = KEYS[e.key.toLowerCase()]; if (d) manual.release(d); });
+addEventListener('blur', () => manual.held.size && manual.clear());
+addEventListener('pagehide', () => { if (port) disconnect(); });
+</script>
+</body>
+</html>
